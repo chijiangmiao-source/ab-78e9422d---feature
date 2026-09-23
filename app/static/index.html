@@ -116,6 +116,12 @@
       <label for="startSel">检修口（起点/终点）</label>
       <select id="startSel"></select>
     </div>
+    <div class="toolbar">
+      <label for="budgetOn">热循环许可</label>
+      <input type="checkbox" id="budgetOn" style="width:auto">
+      <label for="budgetVal">重复段上限（0–32）</label>
+      <input type="number" id="budgetVal" min="0" max="32" step="1" value="4" style="width:76px" disabled>
+    </div>
     <div class="btns">
       <button class="act" id="auditBtn" type="button">发起审计</button>
       <button class="ghost" id="sampleBtn" type="button">载入示例</button>
@@ -138,6 +144,7 @@
         <div class="vector" id="sVector" style="margin-top:3px"></div>
         <div class="chips" id="sChips"></div>
         <div class="hint" id="sOdd"></div>
+        <div class="hint" id="sBudget" style="display:none"></div>
       </div>
     </div>
     <svg id="graph" viewBox="0 0 800 520" preserveAspectRatio="xMidYMid meet"></svg>
@@ -235,6 +242,8 @@ function markBad(locations) {
       } else document.querySelectorAll(".ep-id,.ep-a,.ep-b,.ep-len").forEach(el => el.classList.add("bad"));
     } else if (loc.field === "start") {
       $("startSel").classList.add("bad");
+    } else if (loc.field === "maxRepeats") {
+      $("budgetVal").classList.add("bad");
     }
   });
 }
@@ -261,6 +270,7 @@ async function doAudit() {
     })),
     start: $("startSel").value,
   };
+  if ($("budgetOn").checked) payload.maxRepeats = $("budgetVal").value;
   let resp;
   try {
     const r = await fetch("/api/audit", {
@@ -291,7 +301,8 @@ function showError(msg, locs) {
   let where = "";
   if (locs && locs.length) {
     where = "<div class='locs'>定位：" + locs.map(l => {
-      const name = l.field === "nodes" ? "节点表" : l.field === "edges" ? "管段表" : "检修口";
+      const name = {nodes:"节点表", edges:"管段表", start:"检修口",
+                    maxRepeats:"重复段上限"}[l.field] || l.field;
       return l.row != null ? `${name} 第 ${l.row + 1} 行` : name;
     }).join("；") + "</div>";
   }
@@ -323,6 +334,15 @@ function renderSummary(r) {
     ? `奇度节点（${r.oddVertices.length}）：${r.oddVertices.join("、")}；规范重复边：${
         r.canonicalEdges.length ? r.canonicalEdges.join("、") : "无"}`
     : "所有节点度数均为偶数，无需重复任何管段。";
+  const budgetLine = $("sBudget");
+  if (r.repeatBudget != null) {
+    budgetLine.style.display = "";
+    budgetLine.textContent =
+      `热循环许可：重复段上限 ${r.repeatBudget}；实际重复段数 ${r.duplicatedCount}；` +
+      `相对无限制结果的增程差 +${r.addedLengthDelta}`;
+  } else {
+    budgetLine.style.display = "none";
+  }
 }
 
 /* ---------------- graph ------------------------------------------------- */
@@ -474,6 +494,7 @@ $("addNode").onclick = () => addNodeRow();
 $("addEdge").onclick = () => addEdgeRow();
 $("auditBtn").onclick = doAudit;
 $("sampleBtn").onclick = loadSample;
+$("budgetOn").onchange = () => { $("budgetVal").disabled = !$("budgetOn").checked; };
 
 // initial blank rows
 addNodeRow(""); addNodeRow("");

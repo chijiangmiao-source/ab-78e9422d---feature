@@ -83,3 +83,74 @@ def test_failure_payload_locations():
 def test_malformed_payload_is_safe():
     assert run_audit({})["ok"] is False
     assert run_audit({"nodes": "ab", "edges": None})["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# Repeat-budget mode (热循环许可)
+# ---------------------------------------------------------------------------
+
+DIAMOND = {
+    "nodes": ["A", "B", "C", "D"],
+    "edges": [
+        {"id": "ab", "u": "A", "v": "B", "length": 1},
+        {"id": "bc", "u": "B", "v": "C", "length": 1},
+        {"id": "ad", "u": "A", "v": "D", "length": 1},
+        {"id": "dc", "u": "D", "v": "C", "length": 1},
+        {"id": "ac", "u": "A", "v": "C", "length": 5},
+    ],
+    "start": "A",
+}
+
+
+def test_budget_payload_fields():
+    r = run_audit({**DIAMOND, "maxRepeats": 1})
+    assert r["ok"] is True
+    assert r["repeatBudget"] == 1
+    assert r["addedLength"] == 5  # longer but fewer duplicated segments
+    assert r["addedLengthDelta"] == 3
+    assert r["duplicatedCount"] == 1
+    assert r["optimalCount"] == 1
+    assert r["canonicalVector"] == "01000"
+    assert r["canonicalEdges"] == ["ac"]
+    assert len(r["route"]) == 6  # 5 original edges + 1 repeated copy
+    assert r["route"][0]["from"] == "A" and r["route"][-1]["to"] == "A"
+
+
+def test_budget_keys_absent_when_disabled():
+    # mode off: response shape is exactly the pre-existing one
+    r = run_audit(K4)
+    assert r["ok"] is True
+    assert "repeatBudget" not in r
+    assert "duplicatedCount" not in r
+    assert "addedLengthDelta" not in r
+    r = run_audit({**K4, "maxRepeats": None})
+    assert r["ok"] is True
+    assert "repeatBudget" not in r
+
+
+def test_budget_infeasible_payload():
+    payload = {
+        "nodes": ["A", "B", "C", "D"],
+        "edges": [
+            {"id": "e1", "u": "A", "v": "B", "length": 1},
+            {"id": "e2", "u": "B", "v": "C", "length": 1},
+            {"id": "e3", "u": "C", "v": "D", "length": 1},
+        ],
+        "start": "A",
+        "maxRepeats": 2,
+    }
+    r = run_audit(payload)
+    assert r["ok"] is False
+    assert "预算不可行" in r["error"]
+    assert "maxRepeats" in r["fields"]
+    assert r["locations"][0]["field"] == "maxRepeats"
+
+
+def test_budget_invalid_payload():
+    for bad in (33, -1, "x", 1.5, True):
+        r = run_audit({**K4, "maxRepeats": bad})
+        assert r["ok"] is False
+        assert "maxRepeats" in r["fields"]
+        assert r["locations"][0]["field"] == "maxRepeats"
+    r = run_audit({**K4, "maxRepeats": "2"})
+    assert r["ok"] is True and r["repeatBudget"] == 2

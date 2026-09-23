@@ -42,10 +42,29 @@ never duplicated when G_e[T] == 0.
 The canonical set is built greedily in edge order: bit p is 0 whenever an
 optimum T-join still exists with the edges pinned so far, the newly forced
 edges toggling the parity target.
+
+Repeat-budget mode (热循环许可)
+-------------------------------
+With ``max_repeats`` (0..32) the audit is solved exactly over the feasible
+domain ``{S : S is a T-join and |S| <= max_repeats}`` -- never by solving
+the unconstrained problem first and rejecting the answer afterwards.  Meet
+in the middle on the edge set (m <= 32 -> two halves of <= 16 edges): per
+odd-degree mask, each half keeps the Pareto front of (subset size, weight)
+with exact big-integer way counts (a point survives while its weight does
+not exceed the cheapest weight of any smaller size -- equal-weight larger
+sizes are kept, they all take part in optimal combinations).  Complementary
+masks (odd1 ^ odd2 == T) are combined under the size budget to yield the
+constrained minimum added length, the exact number of co-optimal sets and
+the sets themselves; the canonical 0-preferred vector and the three-way
+classification are then derived from all of them, and the added-length
+delta against the unconstrained optimum is reported.  When no T-join fits
+the budget the audit fails with a dedicated infeasibility error located at
+the budget field.
 """
 
 from __future__ import annotations
 
+import bisect
 import heapq
 import re
 from dataclasses import dataclass, field
@@ -104,6 +123,10 @@ class AuditResult:
     classification: Dict[int, str]  # required | optional | never
     multiplicity: Tuple[int, ...]
     route: Tuple[RouteStep, ...]
+    # repeat-budget mode; all None when the mode is off
+    repeat_budget: Optional[int] = None
+    duplicated_count: Optional[int] = None
+    added_length_delta: Optional[int] = None
 
     @property
     def is_eulerian(self) -> bool:
@@ -127,6 +150,28 @@ def _as_positive_int(value, eid: str) -> int:
     if length <= 0:
         raise AuditError(f"管段 {eid} 长度必须为正整数", ("edges",))
     return length
+
+
+def _as_budget(value) -> int:
+    """Repeat-segment budget: an integer in 0..32, else a located error."""
+    loc = [{"field": "maxRepeats"}]
+    if isinstance(value, bool):
+        raise AuditError(
+            "重复段上限必须为 0 至 32 的整数", ("maxRepeats",), loc
+        )
+    if isinstance(value, int):
+        budget = value
+    elif isinstance(value, str) and re.fullmatch(r"\d+", value.strip()):
+        budget = int(value.strip())
+    else:
+        raise AuditError(
+            "重复段上限必须为 0 至 32 的整数", ("maxRepeats",), loc
+        )
+    if not 0 <= budget <= 32:
+        raise AuditError(
+            f"重复段上限 {budget} 超出 0 至 32 的范围", ("maxRepeats",), loc
+        )
+    return budget
 
 
 def validate_input(
@@ -505,14 +550,164 @@ def enumerate_optimal_tjoins(
 
 
 # ---------------------------------------------------------------------------
+# Repeat-budget mode: exact minimum T-joins under a size cap (meet in the middle)
+# ---------------------------------------------------------------------------
+
+
+def _subset_table(emask, wlen, lo: int, hi: int):
+    """(odd vertex mask, size, weight) of every subset of edges[lo:hi]."""
+    h = hi - lo
+    size = 1 << h
+    odd_of = [0] * size
+    sz = [0] * size
+    wt = [0] * size
+    for s in range(1, size):
+        lb = s & -s
+        b = lb.bit_length() - 1
+        p = s ^ lb
+        odd_of[s] = odd_of[p] ^ emask[lo + b]
+        sz[s] = sz[p] + 1
+        wt[s] = wt[p] + wlen[lo + b]
+    return odd_of, sz, wt
+
+
+def constrained_tjoins(
+    nodes: Sequence[str],
+    edges: Sequence[Edge],
+    odd: Tuple[str, ...],
+    budget: int,
+):
+    """Exact minimum-weight T-joins using at most ``budget`` distinct edges.
+
+    Returns (min_weight, number_of_optimal_sets, list_of_edge_masks), or
+    None when no T-join of size <= budget exists.  Meet in the middle: each
+    half of the edge set (<= 16 edges) is enumerated once; per odd-degree
+    mask the (size, weight) Pareto front keeps every point that is not
+    strictly dominated (a point survives while its weight does not exceed
+    the cheapest weight of any smaller size), with exact big-integer way
+    counts.  Complementary masks (odd1 ^ odd2 == T) are combined under the
+    size budget; a second pass re-collects only the subsets that appear in
+    optimal combinations, so the returned masks are exactly the co-optimal
+    duplicate sets.
+    """
+    vidx = {v: i for i, v in enumerate(nodes)}
+    emask = [(1 << vidx[e.u]) | (1 << vidx[e.v]) for e in edges]
+    wlen = [e.length for e in edges]
+    target = 0
+    for v in odd:
+        target |= 1 << vidx[v]
+
+    m = len(edges)
+    m1 = m // 2
+    tables = [
+        _subset_table(emask, wlen, 0, m1),
+        _subset_table(emask, wlen, m1, m),
+    ]
+
+    fronts = []
+    for odd_of, sz, wt in tables:
+        agg: Dict[int, Dict[int, list]] = {}
+        for s in range(len(odd_of)):
+            om = odd_of[s]
+            c = sz[s]
+            w = wt[s]
+            slot = agg.get(om)
+            if slot is None:
+                slot = agg[om] = {}
+            cur = slot.get(c)
+            if cur is None or w < cur[0]:
+                slot[c] = [w, 1]
+            elif w == cur[0]:
+                cur[1] += 1
+        front = {}
+        for om, slot in agg.items():
+            pts = []
+            min_w: Optional[int] = None
+            for c in sorted(slot):
+                w, ways = slot[c]
+                if min_w is None or w <= min_w:
+                    pts.append((c, w, ways))
+                    min_w = w
+            front[om] = pts
+        fronts.append(front)
+
+    f1_all, f2_all = fronts
+    best: Optional[int] = None
+    count = 0
+    links = []  # (key1, (key2, ...)) pairs taking part in optimal combinations
+    for om1, f1 in f1_all.items():
+        om2 = target ^ om1
+        f2 = f2_all.get(om2)
+        if not f2:
+            continue
+        sizes2 = [p[0] for p in f2]
+        # prefix minima: weights are non-increasing in size, so the cheapest
+        # point with size <= B is the last one; equal-weight ties share the
+        # same weight and must all be counted.
+        pref = []
+        for c2, w2, a2 in f2:
+            if pref and pref[-1][0] == w2:
+                pref.append((w2, pref[-1][1] + a2))
+            else:
+                pref.append((w2, a2))
+        for c1, w1, a1 in f1:
+            rest = budget - c1
+            if rest < 0:
+                break
+            idx = bisect.bisect_right(sizes2, rest) - 1
+            if idx < 0:
+                continue
+            w2, a2 = pref[idx]
+            tot = w1 + w2
+            k2s = tuple((om2, c, w2) for c, w, _ in f2[: idx + 1] if w == w2)
+            if best is None or tot < best:
+                best = tot
+                count = a1 * a2
+                links = [((om1, c1, w1), k2s)]
+            elif tot == best:
+                count += a1 * a2
+                links.append(((om1, c1, w1), k2s))
+
+    if best is None:
+        return None
+
+    keys1 = {k1 for k1, _ in links}
+    keys2 = {k2 for _, k2s in links for k2 in k2s}
+
+    def collect(tab, keys):
+        odd_of, sz, wt = tab
+        out = {k: [] for k in keys}
+        for s in range(len(odd_of)):
+            k = (odd_of[s], sz[s], wt[s])
+            if k in out:
+                out[k].append(s)
+        return out
+
+    got1 = collect(tables[0], keys1)
+    got2 = collect(tables[1], keys2)
+    masks: List[int] = []
+    for k1, k2s in links:
+        for s1 in got1[k1]:
+            for k2 in k2s:
+                for s2 in got2[k2]:
+                    masks.append(s1 | (s2 << m1))
+    assert len(masks) == count
+    return best, count, masks
+
+
+# ---------------------------------------------------------------------------
 # Main audit
 # ---------------------------------------------------------------------------
 
 
 def audit(
-    nodes: Sequence[str], raw_edges: Sequence[dict], start: Optional[str]
+    nodes: Sequence[str],
+    raw_edges: Sequence[dict],
+    start: Optional[str],
+    max_repeats=None,
 ) -> AuditResult:
     nodes, edges = validate_input(nodes, raw_edges, start)
+    budget = None if max_repeats is None else _as_budget(max_repeats)
     adj = adjacency(nodes, edges)
 
     comps = connected_components(nodes, adj)
@@ -531,6 +726,11 @@ def audit(
     odd = tuple(sorted(n for n in nodes if degree[n] % 2 == 1))
     total_length = sum(e.length for e in edges)
     m = len(edges)
+
+    if budget is not None:
+        return _audit_with_budget(
+            nodes, edges, start, odd, comps, total_length, budget
+        )
 
     if not odd:
         empty: FrozenSet[int] = frozenset()
@@ -611,4 +811,90 @@ def audit(
         classification=classification,
         multiplicity=multiplicity,
         route=tuple(route),
+    )
+
+
+def _audit_with_budget(
+    nodes: List[str],
+    edges: List[Edge],
+    start: str,
+    odd: Tuple[str, ...],
+    comps: List[List[str]],
+    total_length: int,
+    budget: int,
+) -> AuditResult:
+    """Audit under a repeat-segment budget: exact constrained optimum.
+
+    The minimisation runs over the whole feasible domain {T-joins of size
+    <= budget}; a longer solution using fewer duplicated segments is chosen
+    whenever the unconstrained optimum does not fit the budget.
+    """
+    m = len(edges)
+
+    # unconstrained optimum (value only) for the added-length delta
+    if odd:
+        nadj = build_nadj(nodes, edges)
+        dist_from: Dict[str, dict] = {s: dijkstra(nodes, nadj, s) for s in nodes}
+        k = len(odd)
+        D = [[INF] * k for _ in range(k)]
+        for i, s in enumerate(odd):
+            for j, t in enumerate(odd):
+                if t in dist_from[s]:
+                    D[i][j] = dist_from[s][t]
+        costdp, _ = matching_dp(D, list(range(k)))
+        unconstrained = costdp[(1 << k) - 1]
+    else:
+        unconstrained = 0
+
+    found = constrained_tjoins(nodes, edges, odd, budget)
+    if found is None:
+        raise AuditError(
+            f"重复段上限 {budget} 下不存在满足奇偶闭合的可行集合，预算不可行",
+            ("maxRepeats",),
+            [{"field": "maxRepeats"}],
+        )
+    optimum, total_count, opt_masks = found
+
+    # canonical: 0 preferred at the earliest edge index => smallest binary
+    # number with edge 0 as most significant bit
+    canonical_mask = min(
+        opt_masks, key=lambda mm: sum(1 << (m - 1 - i) for i in range(m) if mm >> i & 1)
+    )
+    bit_vector = "".join("1" if canonical_mask >> i & 1 else "0" for i in range(m))
+
+    in_all = (1 << m) - 1
+    in_any = 0
+    for mm in opt_masks:
+        in_all &= mm
+        in_any |= mm
+    classification: Dict[int, str] = {}
+    for i in range(m):
+        if in_all >> i & 1:
+            classification[i] = "required"
+        elif in_any >> i & 1:
+            classification[i] = "optional"
+        else:
+            classification[i] = "never"
+
+    multiplicity = tuple(1 + (1 if canonical_mask >> i & 1 else 0) for i in range(m))
+    route = euler_circuit(nodes, edges, start, multiplicity)
+    canonical_set = frozenset(i for i in range(m) if canonical_mask >> i & 1)
+
+    return AuditResult(
+        nodes=nodes,
+        edges=edges,
+        start=start,
+        odd_vertices=odd,
+        components=tuple(tuple(c) for c in comps),
+        total_length=total_length,
+        added_length=int(optimum),
+        optimal_count=total_count,
+        canonical_set=canonical_set,
+        bit_vector=bit_vector,
+        classification=classification,
+        multiplicity=multiplicity,
+        route=tuple(route),
+        repeat_budget=budget,
+        duplicated_count=len(canonical_set),
+        added_length_delta=int(optimum) - int(unconstrained),
     )

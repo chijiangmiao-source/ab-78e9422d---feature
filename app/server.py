@@ -39,7 +39,7 @@ def _serialize(nodes, edges: list[Edge], result) -> Dict[str, Any]:
     for i, st in enumerate(result.route):
         positions[st.edge_index].append(i + 1)
 
-    return {
+    resp = {
         "ok": True,
         "nodes": nodes,
         "edges": edge_objs,
@@ -56,6 +56,13 @@ def _serialize(nodes, edges: list[Edge], result) -> Dict[str, Any]:
         "positions": {str(k): v for k, v in positions.items()},
         "eulerian": result.is_eulerian,
     }
+    # repeat-budget mode adds keys only when enabled; with the mode off the
+    # response keeps its previous shape exactly.
+    if result.repeat_budget is not None:
+        resp["repeatBudget"] = result.repeat_budget
+        resp["duplicatedCount"] = result.duplicated_count
+        resp["addedLengthDelta"] = result.added_length_delta
+    return resp
 
 
 def run_audit(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -68,7 +75,7 @@ def run_audit(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(edges, list):
         edges = []
     try:
-        result = audit(nodes, edges, start)
+        result = audit(nodes, edges, start, payload.get("maxRepeats"))
     except AuditError as exc:
         return {
             "ok": False,

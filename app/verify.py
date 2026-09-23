@@ -89,8 +89,8 @@ def run_pytest() -> bool:
 
 
 def run_domain_checks() -> bool:
-    stage("2/3 奇度同优分类 & 欧拉零增程边界")
-    from app.solver import audit
+    stage("2/3 奇度同优分类 & 欧拉零增程边界 & 重复段上限")
+    from app.solver import AuditError, audit
 
     # odd network: K4 unit weights -> 4 odd vertices, 3 distinct optima
     r = audit(K4["nodes"], K4["edges"], K4["start"])
@@ -140,6 +140,37 @@ def run_domain_checks() -> bool:
     )
     check(len(r3.route) == 3 and r3.route[-1].to == "B",
           "欧拉回路从检修口出发并返回")
+
+    # repeat-budget mode (热循环许可): diamond network
+    dia_nodes = ["A", "B", "C", "D"]
+    dia_edges = [
+        {"id": "ab", "u": "A", "v": "B", "length": 1},
+        {"id": "bc", "u": "B", "v": "C", "length": 1},
+        {"id": "ad", "u": "A", "v": "D", "length": 1},
+        {"id": "dc", "u": "D", "v": "C", "length": 1},
+        {"id": "ac", "u": "A", "v": "C", "length": 5},
+    ]
+    rb = audit(dia_nodes, dia_edges, "A", 1)
+    check(rb.added_length == 5,
+          "上限 1：采用更长但重复段更少的方案（直边增程 5）")
+    check(rb.optimal_count == 1 and rb.duplicated_count == 1,
+          "上限 1：唯一同优集合，实际重复段数为 1")
+    check(rb.added_length_delta == 3, "相对无限制结果的增程差为 3")
+    check(rb.repeat_budget == 1 and rb.bit_vector == "01000",
+          "上限 1：规范位向量指向直边 ac")
+    rb2 = audit(dia_nodes, dia_edges, "A", 2)
+    check(
+        rb2.added_length == 2 and rb2.optimal_count == 2
+        and rb2.added_length_delta == 0,
+        "上限 2：恢复无限制最优（增程 2、两个同优集合、差值 0）",
+    )
+    try:
+        audit(dia_nodes, dia_edges, "A", 0)
+        check(False, "上限 0 的非欧拉管网应报告预算不可行")
+    except AuditError as exc:
+        check("预算不可行" in exc.message
+              and exc.locations[0]["field"] == "maxRepeats",
+              "上限 0：明确报告预算不可行并定位到上限输入")
     return True
 
 
@@ -225,6 +256,22 @@ def run_http_smoke() -> bool:
         check("edges" in body.get("fields", []), "自环错误定位到管段表")
         check(any(l.get("row") == 0 for l in body.get("locations", [])),
               "错误位置精确到第 1 行")
+
+        status, body = _post(base, "/api/audit", {**K4, "maxRepeats": 2})
+        check(status == 200 and body.get("ok") is True
+              and body.get("repeatBudget") == 2
+              and body.get("duplicatedCount") == 2
+              and body.get("addedLengthDelta") == 0
+              and body.get("optimalCount") == 3,
+              "HTTP 重复段上限模式返回上限/实际重复段数/增程差")
+        status, body = _post(base, "/api/audit", {**K4, "maxRepeats": 1})
+        check(body.get("ok") is False
+              and "预算不可行" in body.get("error", "")
+              and "maxRepeats" in body.get("fields", []),
+              "HTTP 上限过小时明确预算不可行并定位")
+        status, body = _post(base, "/api/audit", K4)
+        check(body.get("ok") is True and "repeatBudget" not in body,
+              "关闭上限模式时响应不含预算字段（语义不变）")
         return True
     finally:
         if proc is not None:
