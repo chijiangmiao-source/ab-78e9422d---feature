@@ -15,6 +15,7 @@ import pytest
 
 from app.solver import (
     AuditError,
+    BudgetInfeasible,
     audit,
     build_nadj,
     shortest_path_masks,
@@ -355,3 +356,177 @@ def test_shortest_path_sets_helper():
     dist = dijkstra(nodes, nadj, "A")
     ps = shortest_path_masks(nadj, "A", "B", dist)
     assert set(ps) == {0b0011, 0b1100}
+
+
+# ---------------------------------------------------------------------------
+# Repeat-segment cap mode
+# ---------------------------------------------------------------------------
+
+
+def brute_optimal_capped(nodes, raw_edges, cap):
+    """Oracle in identifier-sorted edge order with cardinality <= cap."""
+    ordered = sorted(raw_edges, key=lambda e: e["id"])
+    m = len(ordered)
+    odd = frozenset(
+        n for n in nodes
+        if sum(1 for e in raw_edges if n in (e["u"], e["v"])) % 2
+    )
+    best = None
+    sets = []
+    for mask in range(1 << m):
+        if mask.bit_count() > cap:
+            continue
+        d = dict.fromkeys(nodes, 0)
+        w = 0
+        for i in range(m):
+            if mask >> i & 1:
+                e = ordered[i]
+                d[e["u"]] += 1
+                d[e["v"]] += 1
+                w += e["length"]
+        if frozenset(n for n in nodes if d[n] % 2) != odd:
+            continue
+        s = frozenset(i for i in range(m) if mask >> i & 1)
+        if best is None or w < best:
+            best, sets = w, [s]
+        elif w == best:
+            sets.append(s)
+    return best, sets
+
+
+def check_capped(r, start, best, sets, cap):
+    m = len(r.edges)
+    assert r.repeat_cap == cap
+    assert r.added_length == best
+    assert r.optimal_count == len(sets)
+    assert r.repeat_count == len(r.canonical_set) <= cap
+    # canonical vector is 0-preferred in identifier order
+    def vec(s):
+        return "".join("1" if i in s else "0" for i in range(m))
+    assert r.bit_vector == min(vec(s) for s in sets)
+    assert set(r.canonical_set) in sets
+    in_all, in_any = set(range(m)), set()
+    for s in sets:
+        in_all &= s
+        in_any |= s
+    for i in range(m):
+        want = (
+            "required" if i in in_all
+            else "optional" if i in in_any
+            else "never"
+        )
+        assert r.classification[i] == want
+    check_route(r, start)
+
+
+def test_cap_longer_but_thinner_wins():
+    # odd A,D; a 3-edge cheap path (weight 3) competes with a single
+    # expensive direct edge (10).  cap=1 forces the longer, thinner set.
+    nodes = list("AXYD")
+    raw = [
+        edge("d1", "A", "D", 10),
+        edge("d2", "A", "D", 100),
+        edge("p1", "A", "X", 1),
+        edge("p2", "X", "Y", 1),
+        edge("p3", "Y", "D", 1),
+    ]
+    r0 = audit(nodes, raw, "A")
+    assert r0.added_length == 3
+    r = audit(nodes, raw, "A", repeat_cap=1)
+    assert r.added_length == 10
+    assert r.optimal_count == 1
+    assert r.bit_vector == "10000"  # id-sorted d1 first
+    assert r.repeat_count == 1
+    assert r.unconstrained_added_length == 3
+    assert r.added_length_delta == 7
+    assert r.classification[0] == "required"
+    assert all(r.classification[i] == "never" for i in (1, 2, 3, 4))
+    check_route(r, "A")
+
+    # cap=2 stays feasible via the same single-edge set (cap is an upper
+    # bound); the longer thinner solution still wins.
+    r2 = audit(nodes, raw, "A", repeat_cap=2)
+    assert r2.added_length == 10 and r2.bit_vector == "10000"
+
+    r3 = audit(nodes, raw, "A", repeat_cap=3)
+    assert r3.added_length == 3 and r3.bit_vector == "00111"
+    assert r3.added_length_delta == 0
+
+
+def test_cap_infeasible():
+    # path A-B-C-D: every T-join needs all 3 edges
+    nodes = list("ABCD")
+    raw = [edge("e1", "A", "B", 1), edge("e2", "B", "C", 1), edge("e3", "C", "D", 1)]
+    with pytest.raises(BudgetInfeasible) as ei:
+        audit(nodes, raw, "A", repeat_cap=2)
+    assert ei.value.cap == 2
+    assert ei.value.min_required == 3
+    assert ei.value.unconstrained_added == 3
+
+    with pytest.raises(BudgetInfeasible):
+        audit(nodes, raw, "A", repeat_cap=0)
+
+    # cap=0 on an Eulerian graph is fine (empty T-join)
+    tri = [edge("a", "A", "B", 3), edge("b", "B", "C", 4), edge("c", "C", "A", 5)]
+    r = audit(list("ABC"), tri, "B", repeat_cap=0)
+    assert r.added_length == 0 and r.repeat_count == 0 and r.added_length_delta == 0
+
+
+def test_cap_k4_matches_unconstrained():
+    nodes = list("ABCD")
+    raw = [
+        edge("e1", "A", "B", 1), edge("e2", "A", "C", 1), edge("e3", "A", "D", 1),
+        edge("e4", "B", "C", 1), edge("e5", "B", "D", 1), edge("e6", "C", "D", 1),
+    ]
+    r = audit(nodes, raw, "A", repeat_cap=2)
+    assert (r.added_length, r.optimal_count, r.bit_vector) == (2, 3, "001100")
+    assert r.added_length_delta == 0
+    with pytest.raises(BudgetInfeasible) as ei:
+        audit(nodes, raw, "A", repeat_cap=1)
+    assert ei.value.min_required == 2
+
+
+def test_invalid_cap():
+    from app.solver import parse_repeat_cap
+    assert parse_repeat_cap(None) is None
+    assert parse_repeat_cap("7") == 7
+    assert parse_repeat_cap(32) == 32 and parse_repeat_cap(0) == 0
+    for bad in (-1, 33, 1.5, "x", "", True, False):
+        with pytest.raises(AuditError):
+            parse_repeat_cap(bad)
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_cap_brute_force_crosscheck(seed):
+    rng = random.Random(1000 + seed)
+    nnodes = rng.randint(2, 6)
+    nodes = [chr(65 + i) for i in range(nnodes)]
+    order = nodes[:]
+    rng.shuffle(order)
+    raw = []
+    for a, b in zip(order, order[1:]):
+        raw.append(edge(f"e{len(raw)}", a, b, rng.randint(1, 8)))
+    target = rng.randint(nnodes - 1, min(10, nnodes * (nnodes - 1) // 2))
+    while len(raw) < target:
+        a, b = rng.sample(nodes, 2)
+        raw.append(edge(f"e{len(raw)}", a, b, rng.randint(1, 8)))
+    start = rng.choice(nodes)
+
+    for cap in range(0, len(raw) + 1):
+        best, sets = brute_optimal_capped(nodes, raw, cap)
+        if best is None:
+            with pytest.raises(BudgetInfeasible):
+                audit(nodes, raw, start, repeat_cap=cap)
+        else:
+            r = audit(nodes, raw, start, repeat_cap=cap)
+            check_capped(r, start, best, sets, cap)
+            assert r.unconstrained_added_length >= 0
+            assert r.added_length_delta == r.added_length - r.unconstrained_added_length
+
+
+def test_cap_mode_does_not_change_default():
+    nodes = list("ABCD")
+    raw = [edge("e1", "A", "B", 1), edge("e2", "B", "C", 1), edge("e3", "C", "D", 1)]
+    r = audit(nodes, raw, "A")
+    assert r.repeat_cap is None and r.added_length_delta is None
+    assert not r.budget_enabled

@@ -48,11 +48,13 @@ from __future__ import annotations
 
 import heapq
 import re
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 INF = 10**30
 TOKEN_RE = re.compile(r"^[!-~]+$")  # printable non-space ASCII
+REPEAT_CAP_MAX = 32
 
 
 class AuditError(ValueError):
@@ -68,6 +70,20 @@ class AuditError(ValueError):
         self.message = message
         self.fields = tuple(fields)
         self.locations = list(locations)
+
+
+class BudgetInfeasible(Exception):
+    """Legal repeat-segment cap under which no parity-closing tour exists.
+
+    Not an :class:`AuditError`: the input is valid, so the API keeps
+    ``ok:true`` and reports the infeasibility separately.
+    """
+
+    def __init__(self, cap: int, min_required: int, unconstrained_added: int):
+        super().__init__(f"重复段上限 {cap} 不可行")
+        self.cap = cap
+        self.min_required = min_required
+        self.unconstrained_added = unconstrained_added
 
 
 @dataclass(frozen=True)
@@ -104,10 +120,24 @@ class AuditResult:
     classification: Dict[int, str]  # required | optional | never
     multiplicity: Tuple[int, ...]
     route: Tuple[RouteStep, ...]
+    # repeat-segment budget mode (None / absent when the mode is disabled)
+    repeat_cap: Optional[int] = None
+    repeat_count: int = 0
+    unconstrained_added_length: Optional[int] = None
 
     @property
     def is_eulerian(self) -> bool:
         return not self.odd_vertices
+
+    @property
+    def budget_enabled(self) -> bool:
+        return self.repeat_cap is not None
+
+    @property
+    def added_length_delta(self) -> Optional[int]:
+        if self.repeat_cap is None or self.unconstrained_added_length is None:
+            return None
+        return self.added_length - self.unconstrained_added_length
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +259,41 @@ def validate_input(
         )
 
     return clean_nodes, edges
+
+
+def parse_repeat_cap(value) -> Optional[int]:
+    """Normalize the optional repeat-segment cap (0..REPEAT_CAP_MAX).
+
+    Absent / falsey values disable the mode.  A present but invalid value is
+    an :class:`AuditError` located at the budget control.
+    """
+    if value is None or isinstance(value, bool):
+        if value is None:
+            return None
+        raise AuditError(
+            f"重复段上限必须为 0 至 {REPEAT_CAP_MAX} 的整数",
+            ("repeatCap",),
+            [{"field": "repeatCap"}],
+        )
+    if isinstance(value, int):
+        cap = value
+    elif isinstance(value, str) and re.fullmatch(r"\d+", value.strip()):
+        cap = int(value.strip())
+    elif isinstance(value, float) and value.is_integer():
+        cap = int(value)
+    else:
+        raise AuditError(
+            f"重复段上限必须为 0 至 {REPEAT_CAP_MAX} 的整数",
+            ("repeatCap",),
+            [{"field": "repeatCap"}],
+        )
+    if not (0 <= cap <= REPEAT_CAP_MAX):
+        raise AuditError(
+            f"重复段上限必须在 0 至 {REPEAT_CAP_MAX} 之间，当前为 {cap}",
+            ("repeatCap",),
+            [{"field": "repeatCap"}],
+        )
+    return cap
 
 
 # ---------------------------------------------------------------------------
@@ -505,12 +570,361 @@ def enumerate_optimal_tjoins(
 
 
 # ---------------------------------------------------------------------------
+# Cardinality-constrained exact solver (repeat-segment budget mode)
+# ---------------------------------------------------------------------------
+#
+# When a cap on the number of distinct duplicated edges is imposed, the
+# cheapest feasible set need not be a minimum T-join of shortest paths: a
+# longer but thinner set (fewer distinct edges) may be the only one fitting
+# the budget.  The matching/shortest-path machinery therefore no longer
+# applies; the problem is
+#
+#     minimize   sum_e w_e x_e
+#     subject to {e : x_e = 1} has odd-degree set exactly T,
+#                |{e : x_e = 1}| <= cap,
+#
+# i.e. exact minimization over edge subsets.  With m <= 32 a meet-in-the
+#-middle split (two halves of <= 16 edges) enumerates 2*2^16 = 131072 subsets;
+# halves meet on the GF(2) parity mask of incident vertices.  B-side subsets
+# are aggregated by (parity, cardinality, weight), so the exact optimum, its
+# co-optimal set count (arbitrary-precision Python ints) and per-edge
+# inclusion counts are obtained without enumerating joined solutions.
+
+
+@dataclass
+class ConstrainedOptimum:
+    added: int
+    count: int
+    canonical_mask: int
+    in_all: int
+    in_any: int
+
+
+def _half_arrays(edge_list: Sequence[int], node_bit: Dict[str, int], edges):
+    """Subset parity/weight/cardinality arrays for one MITM half."""
+    h = len(edge_list)
+    size = 1 << h
+    xs = [0] * size
+    ws = [0] * size
+    cs = [0] * size
+    for mask in range(1, size):
+        lb = mask & -mask
+        j = lb.bit_length() - 1
+        prev = mask ^ lb
+        e = edges[edge_list[j]]
+        xs[mask] = xs[prev] ^ node_bit[e.u] ^ node_bit[e.v]
+        ws[mask] = ws[prev] + e.length
+        cs[mask] = cs[prev] + 1
+    return edge_list, xs, ws, cs
+
+
+def solve_cardinality_constrained(
+    nodes: Sequence[str],
+    edges: Sequence[Edge],
+    odd: Tuple[str, ...],
+    cap: int,
+) -> Optional[ConstrainedOptimum]:
+    """Exact optimum among parity-closing sets with at most ``cap`` edges."""
+    m = len(edges)
+    node_bit = {n: 1 << i for i, n in enumerate(nodes)}
+    target = 0
+    for n in odd:
+        target |= node_bit[n]
+
+    split = m // 2
+    a_edges = list(range(split))
+    b_edges = list(range(split, m))
+    _, xpa, wa, ca = _half_arrays(a_edges, node_bit, edges)
+    _, xpb, wb, cb = _half_arrays(b_edges, node_bit, edges)
+    size_a, size_b = len(xpa), len(xpb)
+
+    # ---- aggregate B side: by parity, then weight -> counts per card ------
+    # minCard[p] / minW[p][c] for the optimum-weight pass;
+    # tab[p][w] = length-(hb+1) array, cumulative count with card <= c.
+    min_card_b: Dict[int, int] = {}
+    min_w_b: Dict[int, Dict[int, int]] = {}
+    tab: Dict[int, Dict[int, list]] = {}
+    for b in range(size_b):
+        p, w, c = xpb[b], wb[b], cb[b]
+        if p not in min_card_b or c < min_card_b[p]:
+            min_card_b[p] = c
+        d = min_w_b.setdefault(p, {})
+        if c not in d or w < d[c]:
+            d[c] = w
+        wt = tab.setdefault(p, {})
+        arr = wt.get(w)
+        if arr is None:
+            arr = [0] * (len(b_edges) + 1)
+            wt[w] = arr
+        arr[c] += 1
+    # prefix minima / cumulative counts
+    min_w_pref: Dict[int, List[int]] = {}
+    hb = len(b_edges)
+    for p, d in min_w_b.items():
+        pref = [INF] * (hb + 1)
+        run = INF
+        for c in range(hb + 1):
+            if c in d:
+                run = min(run, d[c])
+            pref[c] = run
+        min_w_pref[p] = pref
+    for wt in tab.values():
+        for arr in wt.values():
+            for c in range(1, hb + 1):
+                arr[c] += arr[c - 1]
+
+    # ---- pass 1: optimum weight (and feasible-cardinality gating) --------
+    best = INF
+    for a in range(size_a):
+        q = target ^ xpa[a]
+        cmax = cap - ca[a]
+        if cmax < 0:
+            continue
+        mc = min_card_b.get(q)
+        if mc is None or mc > cmax:
+            continue
+        pref = min_w_pref[q]
+        val = wa[a] + (pref[cmax] if cmax <= hb else pref[hb])
+        if val < best:
+            best = val
+    if best >= INF:
+        return None
+
+    # ---- pass 2: counts (big integers) -----------------------------------
+    # f[a] = number of optimal B subsets joining A subset a under the cap.
+    # Per-B-edge inclusion counts are accumulated via packed counters: each
+    # B edge owns a SLOT-bit lane of one big integer, so adding a subset adds
+    # one to every lane whose edge it contains -- one big-int add replaces a
+    # full table build per edge.  Lane width 33 is provably enough: at most
+    # 2^hb B subsets join at most 2^ha A subsets, product <= 2^32 < 2^33.
+    SLOT = 33
+    LANE_MASK = (1 << SLOT) - 1
+    packtab: Dict[int, Dict[int, list]] = {}
+    pack_inc = [0] * size_b  # packed unit contribution of each B subset
+    for b in range(1, size_b):
+        lb = b & -b
+        j = lb.bit_length() - 1
+        pack_inc[b] = pack_inc[b ^ lb] + (1 << (SLOT * j))
+    for b in range(size_b):
+        wt = packtab.setdefault(xpb[b], {})
+        arr = wt.get(wb[b])
+        if arr is None:
+            arr = [0] * (hb + 1)
+            wt[wb[b]] = arr
+        arr[cb[b]] += pack_inc[b]
+    for wt in packtab.values():
+        for arr in wt.values():
+            for c in range(1, hb + 1):
+                arr[c] += arr[c - 1]
+
+    f = [0] * size_a
+    total = 0
+    b_inclusion_packed = 0
+    for a in range(size_a):
+        cmax = cap - ca[a]
+        if cmax < 0:
+            continue
+        q = target ^ xpa[a]
+        wt = tab.get(q)
+        if wt is None:
+            continue
+        cnt_arr = wt.get(best - wa[a])
+        if cnt_arr is None:
+            continue
+        cclip = min(cmax, hb)
+        n_b = cnt_arr[cclip]
+        f[a] = n_b
+        total += n_b
+        b_inclusion_packed += packtab[q][best - wa[a]][cclip]
+
+    # A-edge inclusion: superset zeta sums of f -> F[i] = sum_{a superset i}
+    ha = len(a_edges)
+    fz = f[:]
+    for i in range(ha):
+        bit = 1 << i
+        for mask in range(size_a):
+            if not (mask & bit):
+                fz[mask] += fz[mask | bit]
+
+    in_all = (1 << m) - 1
+    in_any = 0
+    for local_i in range(ha):
+        ge = fz[1 << local_i]
+        ei = a_edges[local_i]
+        if ge:
+            in_any |= 1 << ei
+        if ge != total:
+            in_all &= ~(1 << ei)
+    for local_j in range(hb):
+        ge = (b_inclusion_packed >> (SLOT * local_j)) & LANE_MASK
+        ei = b_edges[local_j]
+        if ge:
+            in_any |= 1 << ei
+        if ge != total:
+            in_all &= ~(1 << ei)
+
+    # ---- canonical mask: smallest 0-preferred vector among co-optima -----
+    # A-side edges precede B-side edges in edge order, so choose the smallest
+    # feasible A mask first (local bit 0 = MSB), then the smallest B mask.
+    def rev_table(bits: int) -> List[int]:
+        size = 1 << bits
+        rev = [0] * size
+        for x in range(1, size):
+            rev[x] = (rev[x >> 1] >> 1) | ((x & 1) << (bits - 1))
+        return rev
+
+    reva = rev_table(len(a_edges))
+    revb = rev_table(len(b_edges))
+    best_a = None
+    for a in range(size_a):
+        cmax = cap - ca[a]
+        if cmax < 0:
+            continue
+        wt = tab.get(target ^ xpa[a])
+        if wt is None:
+            continue
+        arr = wt.get(best - wa[a])
+        if arr is not None and arr[min(cmax, hb)] > 0:
+            if best_a is None or reva[a] < reva[best_a]:
+                best_a = a
+    assert best_a is not None
+    a = best_a
+    cmax = cap - ca[a]
+    q = target ^ xpa[a]
+    wb_want = best - wa[a]
+    best_b = None
+    for b in range(size_b):
+        if xpb[b] == q and wb[b] == wb_want and cb[b] <= cmax:
+            if best_b is None or revb[b] < revb[best_b]:
+                best_b = b
+    assert best_b is not None
+    canonical_mask = a | (best_b << split)
+
+    return ConstrainedOptimum(
+        added=best,
+        count=total,
+        canonical_mask=canonical_mask,
+        in_all=in_all,
+        in_any=in_any,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main audit
 # ---------------------------------------------------------------------------
 
 
+def _build_result(
+    *,
+    nodes,
+    edges,
+    start,
+    odd,
+    comps,
+    total_length,
+    added_length,
+    optimal_count,
+    canonical_mask,
+    in_all,
+    in_any,
+    m,
+    repeat_cap=None,
+    repeat_count=None,
+    unconstrained_added=None,
+) -> AuditResult:
+    """Assemble the result dataclass from an optimum described by masks."""
+    bit_vector = "".join(
+        "1" if canonical_mask >> i & 1 else "0" for i in range(m)
+    )
+    classification: Dict[int, str] = {}
+    for i in range(m):
+        if in_all >> i & 1:
+            classification[i] = "required"
+        elif in_any >> i & 1:
+            classification[i] = "optional"
+        else:
+            classification[i] = "never"
+
+    multiplicity = tuple(
+        1 + (1 if canonical_mask >> i & 1 else 0) for i in range(m)
+    )
+    route = euler_circuit(nodes, edges, start, multiplicity)
+    if repeat_count is None:
+        repeat_count = canonical_mask.bit_count()
+
+    kwargs = {}
+    if repeat_cap is not None:
+        kwargs = dict(
+            repeat_cap=repeat_cap,
+            repeat_count=repeat_count,
+            unconstrained_added_length=unconstrained_added,
+        )
+    return AuditResult(
+        nodes=nodes,
+        edges=edges,
+        start=start,
+        odd_vertices=odd,
+        components=tuple(tuple(c) for c in comps),
+        total_length=total_length,
+        added_length=int(added_length),
+        optimal_count=optimal_count,
+        canonical_set=frozenset(
+            i for i in range(m) if canonical_mask >> i & 1
+        ),
+        bit_vector=bit_vector,
+        classification=classification,
+        multiplicity=multiplicity,
+        route=tuple(route),
+        **kwargs,
+    )
+
+
+def _unconstrained_added(
+    nodes: Sequence[str], edges: Sequence[Edge], odd: Tuple[str, ...]
+) -> int:
+    """Minimum T-join weight under the original (unbounded) problem."""
+    nadj = build_nadj(nodes, edges)
+    dist_from = {s: dijkstra(nadj, nadj, s) for s in nodes}
+    k = len(odd)
+    D = [[INF] * k for _ in range(k)]
+    for i, s in enumerate(odd):
+        for j, t in enumerate(odd):
+            if t in dist_from[s]:
+                D[i][j] = dist_from[s][t]
+    costdp, _ = matching_dp(D, list(range(k)))
+    return int(costdp[(1 << k) - 1])
+
+
+def _minimum_tjoin_cardinality(
+    nodes: Sequence[str], edges: Sequence[Edge], odd: Tuple[str, ...]
+) -> int:
+    """Smallest possible number of distinct edges in any parity-closing set.
+
+    Unweighted all-pairs shortest paths + minimum perfect matching on the
+    odd vertices.  Connected graphs guarantee a finite answer.
+    """
+    adj = adjacency(nodes, edges)
+    k = len(odd)
+    D = []
+    for s in odd:
+        dist = {s: 0}
+        dq = deque([s])
+        while dq:
+            x = dq.popleft()
+            for y, _ in adj[x]:
+                if y not in dist:
+                    dist[y] = dist[x] + 1
+                    dq.append(y)
+        D.append([dist.get(t, INF) for t in odd])
+    costdp, _ = matching_dp(D, list(range(k)))
+    return int(costdp[(1 << k) - 1])
+
+
 def audit(
-    nodes: Sequence[str], raw_edges: Sequence[dict], start: Optional[str]
+    nodes: Sequence[str],
+    raw_edges: Sequence[dict],
+    start: Optional[str],
+    repeat_cap: Optional[int] = None,
 ) -> AuditResult:
     nodes, edges = validate_input(nodes, raw_edges, start)
     adj = adjacency(nodes, edges)
@@ -531,6 +945,38 @@ def audit(
     odd = tuple(sorted(n for n in nodes if degree[n] % 2 == 1))
     total_length = sum(e.length for e in edges)
     m = len(edges)
+
+    # ------------------------------------------------------------------
+    # Budget mode: exact minimization over parity-closing sets with at most
+    # ``repeat_cap`` distinct duplicated edges.  This is *not* a filter on
+    # the unconstrained optimum -- a longer but thinner solution may win.
+    # ------------------------------------------------------------------
+    if repeat_cap is not None:
+        unconstrained_added = 0 if not odd else _unconstrained_added(
+            nodes, edges, odd
+        )
+        if not odd:
+            opt = ConstrainedOptimum(
+                added=0, count=1, canonical_mask=0, in_all=0, in_any=0
+            )
+        else:
+            opt = solve_cardinality_constrained(nodes, edges, odd, repeat_cap)
+            if opt is None:
+                min_card = _minimum_tjoin_cardinality(nodes, edges, odd)
+                raise BudgetInfeasible(
+                    repeat_cap, min_card, unconstrained_added
+                )
+        return _build_result(
+            nodes=nodes, edges=edges, start=start, odd=odd, comps=comps,
+            total_length=total_length,
+            added_length=opt.added,
+            optimal_count=opt.count,
+            canonical_mask=opt.canonical_mask,
+            in_all=opt.in_all, in_any=opt.in_any, m=m,
+            repeat_cap=repeat_cap,
+            repeat_count=opt.canonical_mask.bit_count(),
+            unconstrained_added=unconstrained_added,
+        )
 
     if not odd:
         empty: FrozenSet[int] = frozenset()
@@ -576,39 +1022,18 @@ def audit(
     canonical_mask = min(
         opt_masks, key=lambda mm: sum(1 << (m - 1 - i) for i in range(m) if mm >> i & 1)
     )
-    bit_vector = "".join("1" if canonical_mask >> i & 1 else "0" for i in range(m))
 
     in_all = (1 << m) - 1
     in_any = 0
     for mm in opt_masks:
         in_all &= mm
         in_any |= mm
-    classification: Dict[int, str] = {}
-    for i in range(m):
-        if in_all >> i & 1:
-            classification[i] = "required"
-        elif in_any >> i & 1:
-            classification[i] = "optional"
-        else:
-            classification[i] = "never"
 
-    multiplicity = tuple(1 + (1 if canonical_mask >> i & 1 else 0) for i in range(m))
-    route = euler_circuit(nodes, edges, start, multiplicity)
-
-    return AuditResult(
-        nodes=nodes,
-        edges=edges,
-        start=start,
-        odd_vertices=odd,
-        components=tuple(tuple(c) for c in comps),
+    return _build_result(
+        nodes=nodes, edges=edges, start=start, odd=odd, comps=comps,
         total_length=total_length,
-        added_length=int(optimum),
+        added_length=optimum,
         optimal_count=total_count,
-        canonical_set=frozenset(
-            i for i in range(m) if canonical_mask >> i & 1
-        ),
-        bit_vector=bit_vector,
-        classification=classification,
-        multiplicity=multiplicity,
-        route=tuple(route),
+        canonical_mask=canonical_mask,
+        in_all=in_all, in_any=in_any, m=m,
     )

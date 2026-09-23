@@ -140,6 +140,31 @@ def run_domain_checks() -> bool:
     )
     check(len(r3.route) == 3 and r3.route[-1].to == "B",
           "欧拉回路从检修口出发并返回")
+
+    # repeat-segment cap mode: a longer but thinner solution must win
+    thin_nodes = ["A", "X", "Y", "D"]
+    thin_edges = [
+        {"id": "d1", "u": "A", "v": "D", "length": 10},
+        {"id": "d2", "u": "A", "v": "D", "length": 100},
+        {"id": "p1", "u": "A", "v": "X", "length": 1},
+        {"id": "p2", "u": "X", "v": "Y", "length": 1},
+        {"id": "p3", "u": "Y", "v": "D", "length": 1},
+    ]
+    from app.solver import BudgetInfeasible
+    rc = audit(thin_nodes, thin_edges, "A", repeat_cap=1)
+    check(rc.added_length == 10 and rc.bit_vector == "10000",
+          "上限 1 时采用更长但仅 1 段的方案（增程 10）")
+    check(rc.repeat_count == 1 and rc.added_length_delta == 7,
+          "实际重复段数为 1，相对无限制增程差为 7")
+    check(rc.optimal_count == 1
+          and rc.classification[0] == "required"
+          and all(rc.classification[i] == "never" for i in (1, 2, 3, 4)),
+          "预算模式按本模式全部最低增程集合重算三类归属")
+    try:
+        audit(thin_nodes, thin_edges, "A", repeat_cap=0)
+        check(False, "上限 0 在奇度管网上不可行")
+    except BudgetInfeasible as exc:
+        check(exc.min_required == 1, "上限 0 报告至少需要 1 个重复段")
     return True
 
 
@@ -225,6 +250,42 @@ def run_http_smoke() -> bool:
         check("edges" in body.get("fields", []), "自环错误定位到管段表")
         check(any(l.get("row") == 0 for l in body.get("locations", [])),
               "错误位置精确到第 1 行")
+
+        # budget mode: longer-but-thinner feasible, and infeasible budget
+        thin = {
+            "nodes": ["A", "X", "Y", "D"],
+            "edges": [
+                {"id": "d1", "u": "A", "v": "D", "length": 10},
+                {"id": "d2", "u": "A", "v": "D", "length": 100},
+                {"id": "p1", "u": "A", "v": "X", "length": 1},
+                {"id": "p2", "u": "X", "v": "Y", "length": 1},
+                {"id": "p3", "u": "Y", "v": "D", "length": 1},
+            ],
+            "start": "A",
+            "repeatCap": 1,
+        }
+        status, body = _post(base, "/api/audit", thin)
+        check(body.get("ok") is True and body.get("budgetFeasible") is True,
+              "预算模式审计成功")
+        check(body.get("addedLength") == 10 and body.get("repeatCount") == 1
+              and body.get("addedLengthDelta") == 7,
+              "预算模式返回增程 10、实际 1 段、增程差 7")
+
+        infeasible = {
+            "nodes": ["A", "B", "C", "D"],
+            "edges": [
+                {"id": "e1", "u": "A", "v": "B", "length": 1},
+                {"id": "e2", "u": "B", "v": "C", "length": 1},
+                {"id": "e3", "u": "C", "v": "D", "length": 1},
+            ],
+            "start": "A",
+            "repeatCap": 2,
+        }
+        status, body = _post(base, "/api/audit", infeasible)
+        check(body.get("ok") is True and body.get("budgetFeasible") is False,
+              "合法但预算不可行返回 ok=true 且 budgetFeasible=false")
+        check(body.get("minimumRepeatCount") == 3,
+              "不可行时报告至少需要 3 个重复段")
         return True
     finally:
         if proc is not None:

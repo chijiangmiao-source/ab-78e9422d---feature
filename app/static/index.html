@@ -41,6 +41,14 @@
   #error { display:none; background:rgba(255,93,93,.12); border:1px solid var(--req);
            color:#ffb3b3; border-radius:8px; padding:9px 12px; margin-top:10px; font-size:13px;}
   #error .locs { color:var(--muted); font-size:12px; margin-top:4px;}
+  #budgetBar { display:none; background:rgba(245,181,61,.12); border:1px solid var(--opt);
+           color:#ffd98a; border-radius:8px; padding:10px 12px; margin-bottom:10px; font-size:13px;}
+  #budgetBar .sub { color:var(--muted); font-size:12px; margin-top:4px;}
+  .budgetline { display:none; margin-top:10px; background:var(--panel2); border:1px solid var(--line);
+           border-radius:8px; padding:8px 11px; font-size:13px; color:var(--muted);}
+  .budgetline b { color:var(--text); }
+  .budgetline .delta { color:var(--opt); font-weight:700; }
+  .budgetline .zero { color:var(--ok); font-weight:700; }
   .stats { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
   .stat { background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:9px 11px;}
   .stat .k { color:var(--muted); font-size:12px;}
@@ -116,6 +124,15 @@
       <label for="startSel">检修口（起点/终点）</label>
       <select id="startSel"></select>
     </div>
+    <div class="toolbar" style="align-items:center">
+      <label style="display:flex;align-items:center;gap:6px;color:var(--text)">
+        <input type="checkbox" id="capEnable" style="width:auto">
+        限定重复段上限
+      </label>
+      <input type="number" id="capValue" min="0" max="32" step="1" value="0"
+             style="width:84px; display:none" disabled>
+      <label for="capValue" id="capHint" style="display:none">0–32 个不同管段</label>
+    </div>
     <div class="btns">
       <button class="act" id="auditBtn" type="button">发起审计</button>
       <button class="ghost" id="sampleBtn" type="button">载入示例</button>
@@ -126,13 +143,15 @@
   <!-- ================= graph + summary ================= -->
   <div class="panel">
     <h2>② 审计结果与管网图</h2>
+    <div id="budgetBar"></div>
     <div id="summary" style="display:none">
       <div class="stats">
         <div class="stat"><div class="k">原管网总长度</div><div class="v" id="sTotal"></div></div>
-        <div class="stat"><div class="k">最小增加长度</div><div class="v" id="sAdded"></div></div>
+        <div class="stat"><div class="k" id="sAddedLabel">最小增加长度</div><div class="v" id="sAdded"></div></div>
         <div class="stat"><div class="k">同优重复集合数量</div><div class="v" id="sCount"></div></div>
         <div class="stat"><div class="k">路线总长度</div><div class="v" id="sRoute"></div></div>
       </div>
+      <div class="budgetline" id="sBudget"></div>
       <div style="margin-top:10px">
         <div class="k" style="color:var(--muted);font-size:12px">规范重复边（按标识顺序的 0 优先位向量）</div>
         <div class="vector" id="sVector" style="margin-top:3px"></div>
@@ -235,8 +254,16 @@ function markBad(locations) {
       } else document.querySelectorAll(".ep-id,.ep-a,.ep-b,.ep-len").forEach(el => el.classList.add("bad"));
     } else if (loc.field === "start") {
       $("startSel").classList.add("bad");
+    } else if (loc.field === "repeatCap") {
+      $("capValue").classList.add("bad");
     }
   });
+}
+
+function clearBudgetBar() {
+  const bar = $("budgetBar");
+  bar.style.display = "none";
+  bar.innerHTML = "";
 }
 
 function clearConclusion() {
@@ -245,12 +272,14 @@ function clearConclusion() {
   $("graph").innerHTML = "";
   $("route").innerHTML = "";
   $("routeEmpty").style.display = "";
+  clearBudgetBar();
 }
 
 /* ---------------- audit call ------------------------------------------- */
 async function doAudit() {
   $("error").style.display = "none";
   clearBadMarks();
+  const capEnabled = $("capEnable").checked;
   const payload = {
     nodes: [...document.querySelectorAll(".node-in")].map(i => i.value.trim()),
     edges: [...document.querySelectorAll("#edgeRows tr")].map(tr => ({
@@ -261,6 +290,7 @@ async function doAudit() {
     })),
     start: $("startSel").value,
   };
+  if (capEnabled) payload.repeatCap = $("capValue").value;
   let resp;
   try {
     const r = await fetch("/api/audit", {
@@ -274,16 +304,33 @@ async function doAudit() {
     return;
   }
   if (!resp.ok) {
-    // 失败时保留输入并清除旧结论
+    // 校验失败：保留输入并清除旧结论
     showError(resp.error, resp.locations);
     markBad(resp.locations);
     clearConclusion();
+    return;
+  }
+  if (resp.budgetFeasible === false) {
+    // 输入合法但预算不可行：保留编辑内容，清空旧结论，明确提示
+    clearConclusion();
+    renderBudgetInfeasible(resp);
     return;
   }
   lastResult = resp;
   renderSummary(resp);
   renderGraph(resp);
   renderRoute(resp);
+}
+
+function renderBudgetInfeasible(r) {
+  const bar = $("budgetBar");
+  const min = r.minimumRepeatCount;
+  bar.innerHTML =
+    `⚠ 重复段上限 <b>${r.repeatCap}</b> 不可行：任何奇度闭合路线至少需要重复 ` +
+    `<b>${min}</b> 个不同管段。请把上限提高到 ${min} 或以上后重新审计。` +
+    `<div class="sub">无限制模式下最小增程为 ${r.unconstrainedAddedLength}；` +
+    `当前编辑内容已保留，未产生审计结论。</div>`;
+  bar.style.display = "block";
 }
 
 function showError(msg, locs) {
@@ -301,11 +348,27 @@ function showError(msg, locs) {
 
 /* ---------------- summary ----------------------------------------------- */
 function renderSummary(r) {
+  clearBudgetBar();
   $("summary").style.display = "";
   $("sTotal").textContent = r.totalLength;
   $("sAdded").textContent = r.addedLength + (r.eulerian ? "（欧拉管网，零增程）" : "");
   $("sCount").textContent = r.optimalCount;
   $("sRoute").textContent = r.totalLength + r.addedLength;
+  const bl = $("sBudget");
+  if (r.budgetFeasible === true && r.repeatCap != null) {
+    $("sAddedLabel").textContent = `上限 ${r.repeatCap} 下最小增加长度`;
+    const d = r.addedLengthDelta;
+    const deltaTxt = d === 0
+      ? `<span class="zero">与无限制结果相同（增程差 0）</span>`
+      : `较无限制结果多增程 <span class="delta">+${d}</span>（无限制最小增程 ${r.unconstrainedAddedLength}）`;
+    bl.innerHTML =
+      `重复段上限：<b>${r.repeatCap}</b> 个不同管段 ｜ 规范方案实际重复：<b>${r.repeatCount}</b> 个 ｜ ${deltaTxt}`;
+    bl.style.display = "block";
+  } else {
+    $("sAddedLabel").textContent = "最小增加长度";
+    bl.style.display = "none";
+    bl.innerHTML = "";
+  }
   const vec = r.canonicalVector;
   $("sVector").innerHTML = [...vec].map((b, i) =>
     `<b class="${b === "1" ? "c1" : ""}">${b}</b>`).join("");
@@ -474,6 +537,21 @@ $("addNode").onclick = () => addNodeRow();
 $("addEdge").onclick = () => addEdgeRow();
 $("auditBtn").onclick = doAudit;
 $("sampleBtn").onclick = loadSample;
+$("capEnable").onchange = () => {
+  const on = $("capEnable").checked;
+  $("capValue").style.display = on ? "" : "none";
+  $("capHint").style.display = on ? "" : "none";
+  $("capValue").disabled = !on;
+};
+$("capValue").addEventListener("input", () => {
+  const v = Number($("capValue").value);
+  $("auditBtn").disabled = false;
+  if ($("capValue").value !== "" && (v < 0 || v > 32 || !Number.isInteger(v))) {
+    $("capValue").classList.add("bad");
+  } else {
+    $("capValue").classList.remove("bad");
+  }
+});
 
 // initial blank rows
 addNodeRow(""); addNodeRow("");

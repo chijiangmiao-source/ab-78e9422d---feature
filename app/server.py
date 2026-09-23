@@ -5,7 +5,14 @@ from __future__ import annotations
 import os
 from typing import Any, Dict
 
-from .solver import AuditError, Edge, RouteStep, audit
+from .solver import (
+    AuditError,
+    BudgetInfeasible,
+    Edge,
+    RouteStep,
+    audit,
+    parse_repeat_cap,
+)
 
 
 def _serialize(nodes, edges: list[Edge], result) -> Dict[str, Any]:
@@ -39,7 +46,7 @@ def _serialize(nodes, edges: list[Edge], result) -> Dict[str, Any]:
     for i, st in enumerate(result.route):
         positions[st.edge_index].append(i + 1)
 
-    return {
+    payload = {
         "ok": True,
         "nodes": nodes,
         "edges": edge_objs,
@@ -56,6 +63,13 @@ def _serialize(nodes, edges: list[Edge], result) -> Dict[str, Any]:
         "positions": {str(k): v for k, v in positions.items()},
         "eulerian": result.is_eulerian,
     }
+    if result.budget_enabled:
+        payload["repeatCap"] = result.repeat_cap
+        payload["repeatCount"] = result.repeat_count
+        payload["unconstrainedAddedLength"] = result.unconstrained_added_length
+        payload["addedLengthDelta"] = result.added_length_delta
+        payload["budgetFeasible"] = True
+    return payload
 
 
 def run_audit(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -68,7 +82,20 @@ def run_audit(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(edges, list):
         edges = []
     try:
-        result = audit(nodes, edges, start)
+        repeat_cap = (
+            parse_repeat_cap(payload["repeatCap"])
+            if "repeatCap" in payload
+            else None
+        )
+        result = audit(nodes, edges, start, repeat_cap=repeat_cap)
+    except BudgetInfeasible as exc:
+        return {
+            "ok": True,
+            "budgetFeasible": False,
+            "repeatCap": exc.cap,
+            "minimumRepeatCount": exc.min_required,
+            "unconstrainedAddedLength": exc.unconstrained_added,
+        }
     except AuditError as exc:
         return {
             "ok": False,
